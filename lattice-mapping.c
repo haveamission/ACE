@@ -64,6 +64,8 @@ struct lattice_rule	*freeze_lattice_rule(struct lattice_rule	*r)
 	fr->nposition_constraints = r->nposition_constraints;
 	fr->position_constraints = freeze_block(r->position_constraints,
 		sizeof(struct lattice_position_constraint)*(r->nposition_constraints));
+	fr->context_negated = freeze_block(r->context_negated,
+		sizeof(int) * (r->ncontext > 0 ? r->ncontext : 1));
 	fr->regex_constraints = slab_alloc(sizeof(struct lattice_regex_constraints)*(fr->ninput+fr->ncontext));
 	fr->jump_on_match = r->jump_on_match;
 	int i, j;
@@ -310,6 +312,12 @@ struct lattice_rule	*study_lattice_rule(char	*name, struct dg	*dg)
 			pc->rhs_what = rhs_what;
 			pc->lhs_which = lhs_which;
 			pc->rhs_which = rhs_which;
+			pc->negated = 0;
+			if(type[0] == '!')
+			{
+				pc->negated = 1;
+				memmove(type, type+1, strlen(type));
+			}
 			     if(!strcmp(type, "<"))pc->type = lpcImmediatelyPreceeds;
 			else if(!strcmp(type, ">"))
 			{
@@ -340,6 +348,31 @@ struct lattice_rule	*study_lattice_rule(char	*name, struct dg	*dg)
 			if(*cp) { cp = again_rhs; goto again; }
 			else if(comma)cp = comma+1;
 			else break;
+		}
+	}
+	r->context_negated = calloc(r->ncontext > 0 ? r->ncontext : 1, sizeof(int));
+	{
+		int c;
+		for(c = 0; c < r->ncontext; c++)
+		{
+			int all_negated = 0, any_ref = 0;
+			int p;
+			for(p = 0; p < r->nposition_constraints; p++)
+			{
+				struct lattice_position_constraint *pc = r->position_constraints + p;
+				int refs_this = 0;
+				if(pc->lhs_what == 'C' && pc->lhs_which == c)refs_this = 1;
+				if(pc->rhs_what == 'C' && pc->rhs_which == c)refs_this = 1;
+				if(refs_this)
+				{
+					any_ref = 1;
+					if(pc->negated)all_negated = 1;
+					else { all_negated = 0; break; }
+				}
+			}
+			r->context_negated[c] = (any_ref && all_negated);
+			if(r->context_negated[c])
+				DEBUG_VERBOSE("lattice rule '%s': context %d is negated\n", r->name, c+1);
 		}
 	}
 	return r;
@@ -1111,6 +1144,30 @@ int	apply_lattice_rule1(struct lattice	*lat, struct lattice_rule	*r, struct latt
 	}
 	else
 	{
+		if(have >= r->ninput && r->context_negated[have - r->ninput])
+		{
+			int negation_violated = 0;
+			for(i = 0; i < lat->nedges; i++)
+			{
+				struct lattice_edge *e = lat->edges[i];
+				int k;
+				for(k = 0; k < have; k++)
+					if(inputs[k] == e) break;
+				if(k < have) continue;
+				inputs[have] = e;
+				bump_generation();
+				if(lattice_rule_matches(lat, r, inputs, have, have+1, NULL))
+				{
+					negation_violated = 1;
+					break;
+				}
+			}
+			inputs[have] = NULL;
+			if(negation_violated)
+				return 0;
+			return apply_lattice_rule1(lat, r, inputs, input_ids, have+1, mats);
+		}
+
 		if(have)bump_generation();
 		// find next input candidate
 
@@ -1189,6 +1246,14 @@ int	initialize_possible_map(struct lattice	*lat, struct lattice_rule	*r)
 		int i, j;
 		for(i=0;i<r->ninput+r->ncontext;i++)
 		{
+			if(i >= r->ninput && r->context_negated[i - r->ninput])
+			{
+				int j;
+				for(j=0;j<lat->nedges;j++)
+					possible_map[j*(r->ninput+r->ncontext) + i] = 1;
+				nspots++;
+				continue;
+			}
 			int	count = 0;
 			for(j=0;j<lat->nedges;j++)
 			{

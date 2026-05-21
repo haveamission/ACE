@@ -57,7 +57,10 @@ struct lattice_rule
 			lpcImmediatelyFollows,
 			lpcCovers
 		}	type;
+		int	negated;
 	}	*position_constraints;
+	int	nnegated_contexts;
+	int	*negated_context_indices;
 	int	jump_on_match;
 };
 
