@@ -1,0 +1,364 @@
+TODO:
+
+- ace bugs:
+	- fix recursive labeling to check for cycles or empty SLASH difflists
+	- can run out of skolem constants if a grammar doesn't supply very many strings; work around this. maybe just fabricate our own skolem constants anyway?
+	- index accessibility filtering and subsumption packing are actually subtly incompatible. shows up in GG -- override frozen edge warnings in unpack.c for now.
+	- *possible* theoretical bug...
+		- the index accessibility filter identifies variables by their INSTLOC.  the two variables in a QEQ have the same INSTLOC, when cheap-scoping is on (e.g. all common grammars?).  that means when we collect_vars() we could mis-identify them.  if < x qeq y >, then suppose there were an edge A with x accessible and y not yet mentioned.  if R(A) makes x inaccessible, we may declare y inaccessible too.  then if other parts of the semantics reference y, R(A) will be wrongly rejected.
+		- on the other hand, it's not clear that this can actually happen.  if R(A) makes x inaccessible and y has not been mentioned yet, then there's no way for the < x qeq y > HCONS element to be built, right?
+		- conversely (and more plausibly), x will likely stay accessible long after y is made inaccessible.  unfortunately, we won't be able to notice that y was made inaccessible, because x looks the same.  result: edges may pass the filter that could have been rejected!
+
+things that would be nice:
+
+- reduce .dat file size
+	- store maxent model more efficiently; it takes 67MB currently
+	- improve 'simple lexemes' facility; only getting 62% currently, and ERG-specific
+		- erg: 39k lexemes, 24k simple; 10MB worth of lexeme dags in .dat file
+			average of 256 bytes per lexeme... in .tdl it's just 134 bytes for a typical lexeme
+			name, type, orth, pred, onset
+			struct lexeme = 44 bytes + stemlist = 8 more typically, + 8 byte pointer in lexemes[] = 60 bytes per lexeme not counting any strings or string types
+			+ typical 10? bytes for name = 70
+			-> expect roughly 2.8M of 'struct lexeme'; actual = 3.1M. ok.
+			+ orth type and pred type
+			struct type = 56 bytes + name + entry in strings[] = 75
+			-> roughly 6M of 'struct type's for lexicon
+			15k non-simple lexemes -> 650 bytes of dag each -> roughly 13 nodes
+				root, orth, first, rest, synsem, lkeys, keyrel, carg, phon, onset = 10 nodes on typical lexeme
+				plausible.
+				6k of these are n_-_pn_le
+				2k particulate verbs
+				most of the rest are MWE's -- why arent those simple? could be easily
+		- automatic templates by lextype?
+
+- speed up lexical instantiation; GLEs are currently built and unified with each token, but something quickcheck-like could rule out almost all cases (token trait and pos)
+
+- robust parsing: allow guidance from a dependency parser or PCFG parser; something like:
+	external guidance suggests edge X is very probable, but ERG does not allow it
+	-> shoehorn it in with robust unification
+
+- robust parsing: after forest construction fails to find a root edge, try top-down prediction
+	- at each rule, assume all but 1 daughter is fully well-formed, hence exists in the (bottom-up) chart
+	- top-down constraint + existing daughter(s) give new constraint for smaller cell, recurse
+	- packing; eventually terminate, with a whole new chart full of predicted (but nonexistant) edges
+	- inside/outside decoding to find tree with best maxent score subject to constraint that only one unification will fail (hence needs to be robust)
+		- in reality, information from that robust unification may cause more failures higher up in the tree
+		- compute best outside score available at each prediction edge
+		- for each real edge in that cell, compute total score = outside + inside + scores of features completed by gluing those edges together
+		- no top-down packing: best outside score available at prediction edge X = outside score of X's parent + inside score of X's real daughters + scores of features completed by extending X's parent to X
+		- with packing... just maximize over packing contexts
+
+- find a way to not have to recurse down parts of the dag that are predictably sharable (e.g. are out of generation and are self-contained)
+	- I tried this in the past and decided it was too hard.  why?
+	- each node needs a bit saying whether it's self-contained
+		- X is self contained means: nodes reachable from X [not including X itself] are only reachable by passing through X
+		- computing that bit statically is perhaps not hard
+		- maintaining it when unifying/copying is... impossible to do efficiently?
+			- X&Y is self-contained if X and Y both are... plus some other situations.
+
+- reduce dag node size -- already got rid of 'forward'; can also get rid of 'copy' (merge with 'carcs').
+	- complications:
+		1. subsumption test uses 'copy' and 'carcs'; can use type/forward instead of 'carcs' but will need to verify that this doesn't cause additional trouble.
+		2. transfer reads 'carcs' -- but appears to do so before copy()/finalize_tmp() is called, so the copy/carcs slot would have a carcs interpretation then, so all is well still
+		3. copy() uses both 'carcs' and 'copy'; but once 'carcs' has been read, it can be overwritten as 'copy'; just need to be able to flag which interpretation is active.
+		4. when applying a GLB constraint, we use copy_dg_no_comp_arcs() mid-generation on a dag that might have already been unified with something (!), with the intent of getting a copy of the *original* dag.  this uses the ->copy slot.  either need to stop doing that, or guarantee that the dags we pull that trick on don't have any carcs.  unifier prefers not to add carcs to frozen dags, which helps.  is there a case where the system is forced to unify1(two frozen dags)? yes. so, can be forced to add ->carcs to a type dag brought in on GLB duty.
+			.. so, can't play the game anymore of grabbing the grammar's copy of the type dag and copying later if we need another instance. unclear how big of a slowdown...
+	- could also trade in 8-byte pointers for 2-byte indices into a table, probably -- but the extra indirection may be expensive. for 'type', every dag node being unified would get one. for 'copy', every node being copied would get one... becomes like the previous dgtmp experiment.  which in hindsight wasn't such a terrible thing...
+
+- idea: do an initial parse with a cheaper (strictly less strict) grammar, see what edges are connected to roots, and use that as a top-down filter on a second pass with the full grammar.
+	- a bit like the limiting case of increasing the packing restrictor, but the simpler grammar could be of a significantly different shape
+		- e.g. a (big?) CFG, or: [ how would that CFG filter the main grammar edges? ]
+		- e.g. a quickcheck-only grammar, if we can figure out how to compute/approximate the QC vector of new edges without building the AVM
+			- this version might be ammenable to GPGPU programing
+			- easy to filter main grammar edges: at least one quickcheck edge must subsume each main grammar edge's qc vector
+			- if the first pass (qc only) were fast enough and discriminative enough, might filter out a lot of the superfluous main chart edges
+			- implementation: alter unify_and_build1() to use QC vectors exclusively and not build/unify/copy DAGs at all (on first pass); alter filter() to discard edges that aren't subsumed by a pass1 edge during second pass
+				- could also try (full-grammar) unpacking directly from the QC forest
+				- question as to whether lexical parsing should always be full-grammar, or should be QC-only on the first pass
+			+ actually built a large portion of this -- enough to do the first-pass parse with just QC
+			+ experimented with this a lot while Dan was here... very difficult to create a QC skeleton that is restrictive enough to get some meaningful filtering benefit for the 2nd pass, while still being fast enough to be practical.
+
+- (optionally?) apply mrs-deleted-roles only to post-parsing/post-generation MRS extraction; NOT to transfer-internal extractions
+	- berthold says the apply-it-everywhere behavior matches LKB
+		- but it doesn't necessarily make sense for the GG fixup application application
+			- GG parsing mrs-deleted-roles kills off some superfluous roles
+			- but GG generation mrs-deleted-roles has to keep them around for fixup to work (resulting in ugly MRS outputs from generation -- although generally nobody looks at those anyway)
+
+- automatic configuration generation:
+	- there are lots and lots of things that should be easy to automatically determine when reading grammar TDL files
+	- e.g. cons-type is [probably] where FIRST and REST are introduced; list-type is [probably] the value of REST on cons-type, and null-type is some subtype of list-type incompatible with cons-type --- there may be only one?
+	- e.g. finding optimal/complete list of deleted daughters -- how? seems possible.
+	- e.g. semarg-type should probably be the introducer of the INSTLOC feature
+
+- figure out how to safely use index accessibility filtering and subsumption packing simultaneously
+	- when X packs in Y, and R is a rule/active edge, we don't need to build R(X) since it would pack in R(Y)
+		- but the IAF might reject R(Y) even if it would accept R(X).
+
+- PET cheats and has an explicit mapping from POS type to generic lexeme... which it may or may not actually use?  ACE actually unifies every token into every generic lexeme.
+
+- release.sh:
+	- should look at version.h *in the checked-out copy* and make sure it matches the commandline
+- auto regression tests:
+	- should include NorSource [massifcentral-pos testsuite], HaG [hausa.items testsuite] and JaCY [what testsuite?]
+		- ideally would like confirmation from respective grammarians that ace does the right thing (some version of ACE, some version of the grammar), so that knowing that answers haven't changed is useful
+	- should include some transfer grammar as well
+		- need a tool to test results... do tsdb profiles even store transfer results? probably...
+
+ideas:
+	+ the dag-to-mrs cache is used both by transfer and by parse-result processing, but with different values of inhibit_vpm.  we need to straighten that out.
+		- when idiom testing is being applied, we could in theory be getting VPM'd variables out when we don't want to
+		- after idiom testing is applied, we are in practice getting non-VPM'd variables out when we actually want VPM'd ones (parse "Abrams kept barking." with erg-1111...)
+		- for now, we'll just clear the variable cache after applying idiom testing.  that will slow down mrs extraction some, but getting it right is worth it.
+			- we might be able to keep two separate caches, if we think hard?
+				- clearing both before and after causes a latent crash on:
+					There are many possible starting points to reach the top of the 1775 meter high Rendalssølen.
+					it's not clear why this causes a crash, but we actually don't need to clear before, since reformat_mrs_for_transfer() takes a similar precaution.
+	- [mode to?] make output more script-friendly
+	- unifying and copying:
+		- unifying: Glenn shows a way to completely avoid the ->carcs list, which sounds nice.
+			- unfortunately, it requires us to choose a particular order in unification, so we don't get to try not to forward into frozen dags necessarily -- that means less structure sharing is possible and memory usage goes up.
+			- but if we can ditch ->carcs, memory usage would go *down* too, and throughput might go up?
+			- currently glenn's scheme doesn't work for ACE, because:
+				unifying a passive edge (some subtype of `sign') (with no ARCS feature present due to deleted-daughters) with a daughter position in a rule (type `sign' typically, with an ARCS feature intact): the passive edge's root dag node is technically not wellformed.  it has the more specific type, so it should be the forwarding target, but there's nowhere to store the ARGS feature
+					- actually, comparing numbers of arcs shows identical arities so we try forwarding to the rule position, which has ARGS, but doesn't have C-CONT, a feature introduced on the passive edge.
+				- possible solution: when trimming ARGS, leave a *top* node placeholder.  that would preserve the appropriateness of features to a type, but would violate the appropriateness of types to a feature.
+				- other possible solution: implement Glenn's fallback search
+		- copying: to determine that a node X is shareable, we need to determine that X has not been changed, and that everything reachable from X has not been changed.
+			- in principal this could involve traversing a large section of the graph just to decide not to copy it
+			- idea: what if nodes X had a flag indicating whether it was the case that all access routes to all nodes under X go through X?  maintaining such a flag would be potentially difficult.
+				- but if we had it, then when we come across an X with that flag set, and we see that X has not been recursed into by the unifier, we know X (and its associated subgraph) is shareable, without looking at the whole subgraph under X.
+				- one thing to worry about: if X is shared between two AVMs, it's possible that there is a reentrancy to below X in one of the AVMS and not in the other. I guess we need to be conservative and not flag X as safe in that case.
+					- more complicated: if something below X is shared between two AVMs, then down the road someone else could get a reference into something below X... but I guess the flag is only relevant w.r.t. the top level AVM being copied.
+				- naive algorithm to create the flags:
+					whenever you add an arc A -> B, recursively walk up (other) parents of B until you reach the root or A, and mark them as not self-contained
+					- snag: we don't have parent link lists in dags (there could be lots of parents of any given node... and in this usage we really only want parents from the same top-level AVM... ugh).
+					- also sounds very slow -- but maybe only applicable for manual arc additions that create reentrancies?
+					- for the unifier, there's a quicker algorithm:
+						when unifying two nodes, the result is self-contained if both inputs are.
+							- note that this is not a *necessary* condition:
+								[ X #1, Y #1 ] & [ X [ A #2 ], Y [ A #2 ] ]
+								= [ X #1 [ A top ], Y #1 ]
+								in the right-hand input dag, the path X is not self-contained 
+									(since X.A = Y.A),
+								but in the result dag the reentrancy from Y.A evaporates because X=Y.
+							- but it is a sufficient condition.
+					- how about a naive algorithm to build the flags during a (non-structure-sharing) copy, e.g. the freeze() operation that saves the grammar to disk?
+						- not sure how that would work.
+					- let's get an estimate for how many copy() calls end up sharing instead of copying...
+						answer: 65.9% of nodes get shared instead of copied
+							about half of which are atomic
+						what proportion of these would we be able to *detect* 
+		- should we be doing unfilling?
+
+- now that post-model-path config option exists, Dan could include the model in the ERG distribution instead of in the ACE distribution, perhaps.  copyright issues?
+
+DONE:
+0.9.22
+	- new LUI mode features: commandline editing and history; see list of rules/lexemes/types/instances matching a substring
+	- constraint provenance computation (first pass)
+	- mega_slab's
+	- experimental "dublin" mode (incorporate PCFG edges)
+0.9.21
+	- add ubertagging
+	- make file references from config files relative to config subfiles (e.g. if :include'd from a different directory)
+	- bug fix; token mapping regex capture group references were being hallucinated in inputs contining ${; thanks Matic!
+0.9.20
+	- properly support lettersets with nonascii characters
+	- make orthographemic rules with literal *'s in them work properly
+	- downcase patterns in orthographemic rules (to avoid spurious failure to match)
+0.9.19
+	- add configuration:  transfer-qeq-bridge := true.  (by default)
+0.9.18
+	- make transfer not use INSTLOC for matching
+	- make generation insensitive to presense/absense of "" on input EPs
+0.9.17
+	- fixed fatal error with blank lines for YY mode
+	- TDL input allows type-only definitions of instances (MTRs and lexemes)
+	- added generalization packing -- 30% or so speedup on Cathedral and Bazaar
+	- a lot of new LUI functionality
+	- allow multiple irregular forms for the same stem and the same rule
+	- ask arbiter for more memory when running out during unpacking
+0.9.16
+	- make derivation edge IDs represent unique subtrees, rather than chart edges -- unless --packed-edge-ids is given
+0.9.15
+	- fixed tdl loader bug (%lines not ignored in #|comments|#)
+	- removed a temporary slot, for 15% memory reduction
+0.9.14
+	- new configuration setting `top-hcons-type'; defaults to `qeq', but can be set to `leq' or `none'
+	- option -OO causes *all* forest edges to be output, not just the rooted ones
+	- pos tagger model is configurable by `post-model-path' parameter
+0.9.13
+	- itsdb token counting updated
+	- don't fail as badly when can't find postagger model
+	- when 'invent-ltop: yes.', also add a QEQ
+0.9.12
+	- pass ICONS unchanged through transfer
+0.9.11
+	- improve transfer enough that we can run JAEN at least for simple inputs
+0.9.10
+	- new arbiter communication mechanism whereby ACE and arbiter negotiate RAM limits per item
+	- output :error's more consistently for ITSDB
+	- support forest format for new tsdb schema
+0.9.10pre4
+	- don't overwrite user's config file if they swap -G and -g by mistake
+	- keep track of start/end vertices in lattice mapping
+	- add a free pass-through when a non-spelling-change-rule becomes a spelling-change-rule by way of the irregs table
+	- be a bit more generous about irregs.tab syntax
+0.9.10pre3
+	- roll back (by default) to original +copy+ variable semantics
+	- single quoted 'strings are now warnings and are converted to "STRINGS"
+	- TNT callout
+	- multiple POS tags/probs per word (from TNT or from YY)
+	- lattice mapping is much faster in some circumstances
+	- more structure sharing for generation
+	- code to produce normalized maxent probabilities
+	- itsdb status code output is more uniform
+	- dead code removal from old ad-hoc unknown word handling and chart reduction
+	- fix another packing bug
+	- unifier runs things in a slightly different order, for better subgraph sharing
+0.9.10pre2
+	- initial ICONS support
+0.9.10pre1
+	- fix a lexical packing bug resulting in spurious readings
+	- merge some code for being launched/controlled by LUI
+	- transfer mode: configuration option to prefix a namespace in input EPs
+	- transfer mode: configuration options for input/output VPMs
+	- set locale numeric type to POSIX, to avoid problems reading standard decimals with scanf
+	- make mrs HOOK path configurable
+	- check for cycles in trimmed portion of unification results
+0.9.9
+	- no changes??? even neglected to update the version.h number.
+0.9.8
+	- make FLAGS.SUBSUME with when no SEMI is loaded
+	- make ITSDB forest token output work for token-free grammars
+0.9.7
+	- transfer rules can output new HCONS elements
+	- transfer +copy+ can invent new variables
+	- ??? what else
+0.9.6
+	- ??? what else
+	- trigger rule DAG specialization mechanism
+	- rebuilt HCONS matching in transfer rules
+0.9.6pre1
+	- "cleanup" transfer rules, which apply right after unpack() calls extract_mrs()
+0.9.5
+	- one more TDL case sensitivity...
+	- Version.lsp reading is more robust
+0.9.4
+	- TDL operators are now case insensitive in their LHS
+	- bug fix: generation derivation trees were inflecting token strings in the wrong order
+	- bug fix: copy_mrs() wasn't copying the ->dg field
+	- new --generation-server=LANG option (watches ~/tmp/.transfer.USER.LANG and generates from it)
+	- LUI support for displaying realizations (click for tree, with active nodes)
+0.9.4pre4
+	- fflush for generator script consumption
+	- don't crash when EPs have no LBL
+	- derivation trees from generation have proper token structures and orthographies
+	- new option --show-realization-trees, which prints derivation trees for generation results
+	- new option --show-realization-mrses, which prints MRSes for generation results
+	- support for labeling SLASHes, with configuration options recursive-label-path-in-label and recursive-label-path-in-sign
+	- support for special :c command to show last parse chart in LUI
+	- slightly better communication with LUI (e.g. actually notice when LUI exits, suppress some needless noise)
+	- report an error when attempting to parse and no REPP is loaded, unless in YY mode
+	- new --report-trees option for sending labelled trees to TSDB (or stdout even)
+0.9.4pre3
+	- YY mode
+	- don't output a properties clause for MRS variables that have no properties
+0.9.4pre2
+	- fix MRS characterization output format (thanks Berthold)
+	- new optional post-generation token mapping stage, for visually fixing up generated strings
+0.9.4pre1
+	- bug fixes in fixup
+	- moving towards configurability for transfer-only grammars
+0.9.3
+	- basic version of output-enabled transfer rules, used for mrs fixup for generation
+	- changed post-generation subsumption test to operate on *external* MRSes
+0.9.3pre2
+	- bigger TDL buffer: JaCY's QC skeleton needed it
+	- allow lexemes to have STEM parts that aren't strings
+0.9.3pre1
+	- better parsing of MRS string constants
+	- config option to specify whether LTOP is extracted or invented
+	- fix QC-from-instance loader
+	- changes that speed up lattice mapping a lot in some cases
+	- profiling mode "-i", for parsing
+	- improved filtering of orthographemic rule chain hypotheses
+0.9.2
+	- fix TDL reader/dagify to not conflate coreferences with the same name in different :+ addenda
+	- fix a unicode bug in token mapping
+	- fixed an obscure bug wherein GLB types could have incorrect constraints
+	- don't load token mapping rules when token mapping is disabled
+	- support more than 256 features
+	- support ^ and $ in token mapping positional constraints
+	- support spaces showing up in more unexpected places in TDL syntax
+	- the path to the label within parse-node instances is now configurable (LNAME feature)
+	- semantic indexing now pays attention to the lex-rels-path and rule-rels-path configurations
+	- quickcheck can be loaded from a PET QC instance
+	- new configuration options for limiting the number of orthographemic rules to apply
+	- new configuration option to specify how much room to preallocate in the freezer.
+	- new configuration option to specify what file[s] to load irregulars forms from
+	- new configuration option to specify a suffix for rule names given in irregulars tables
+0.9.1
+	- remove dependence on #include <liba.h>
+	- change ~/logon/ to ${LOGONROOT} in Makefile
+0.9
+
+
+
+
+
+-----
+
+- preprocessor characterization problem:
+	... hole for 'n'
+	... hole for '''
+	... hole for 't'
+	... lost 'n'=>4
+	filling hole 't' with 'n'
+	... lost '''=>5
+	... lost 't'=>6
+	 `(.) +n't' -> `\1n't' yields ` I don't know. '
+
+
+delete deleted daughters from daughters of rule, since they can't ever be present in unified-in daughters
+
+figure out why unpacking is so much slower than PET (sometimes 10x slower!)
+	(note: in that comparison, PET wasn't actually extracting MRSes at all)
+	- mrs extraction is the big bottleneck
+	- approach one: memoization; most bits and pieces of MRS are reused many times
+		- tried this on mrs_var's with good results, should also do ep's and hcon's
+	- type names perhaps should be pointers to types, since much time is spent looking up and comparing types
+	- maybe some other aspects of unpacking are slow? not clear yet.
+
+learn something from head-corner strategy
+
+try to prove/analyze interesting things at grammar compile time
+	- *intelligently* auto pick quickcheck paths
+		- make quickcheck used for packing ignore packing restrictor
+		- and the shameless hack(tm) in qc.c with 0-1-lists
+	- e.g. the INFLECTD is monotonic, '-' becomes '+'
+		- this would help rule out applying inflectional rules like non3sg_fin_verb when 3sg_fin_verb is on the orth-agenda
+		- might be lots of other such features we could find
+	- auto pick packing restrictor
+	- for each type of rule, precompute segments of the rule which are non-reentrant with ARGS[k]
+		- then on filling in ARGS[k], copy() can know to structure-share without looking at those segments
+
+optimize lexicon storage; maybe use provided lexdb schema
+maybe support lexdb
+
+make STEM actually be updated by ortho rules; apparently some grammars depend on it.
+
+fully automated regression testing of both parsing and generation
+	notes:
+		+ this works and is invaluable
+		+ we limit unpacking to some number of MB and 1000 results
+			+ comparison tool should be aware of that somehow
+				+ e.g. diffs in # of results when we run out of RAM are acceptable
+			... diffs after first 1000 results aren't detected... unfortunate.
+		- these days we could record forests and compare those too
+	grammars:
+		+ ERG: mrs, csli, hike
+		+ GG: mrs, babel
+		- HaG: hausa.items
+		- JaCY: ?
+		- NorSource: massifcentral-pos ... LKB and ACE agree (jul-26-2012) modulo LKB bugs
