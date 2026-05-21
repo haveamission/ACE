@@ -59,8 +59,7 @@ struct lattice_rule
 		}	type;
 		int	negated;
 	}	*position_constraints;
-	int	nnegated_contexts;
-	int	*negated_context_indices;
+	int	*context_negated;
 	int	jump_on_match;
 };
 
